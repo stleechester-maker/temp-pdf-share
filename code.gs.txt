@@ -1,0 +1,818 @@
+﻿const APP_VERSION = '3.1.1';
+const STORAGE_PROPERTY = 'TRACK_TRAINING_DESIGN_SPREADSHEET_ID';
+const STORAGE_FILE_NAME = 'Track and Field Training Design - Data';
+
+
+const PLANS_SHEET_NAME = 'Plans';
+const DAYS_SHEET_NAME = 'Days';
+const WEEKS_SHEET_NAME = 'Weeks';
+const PRACTICE_WEEKS_SHEET_NAME = 'PracticeWeeks';
+const PRACTICE_DAYS_SHEET_NAME = 'PracticeDays';
+
+
+const PLAN_HEADERS = [
+  'Plan ID', 'Plan Name', 'Season Type', 'Custom Season Type', 'Training Group',
+  'Custom Group Name', 'Start Date', 'End Date', 'Mesocycles JSON', 'Created At', 'Updated At'
+];
+const DAY_HEADERS = ['Plan ID', 'Date', 'Workload', 'Competition', 'Competition Name', 'Notes'];
+const WEEK_HEADERS = [
+  'Plan ID', 'Week Start', 'Week End', 'Mesocycle Theme', 'Microcycle Theme',
+  'Demand JSON', 'Priorities JSON', 'Day Plans JSON', 'Created At', 'Updated At'
+];
+const PRACTICE_WEEK_HEADERS = [
+  'Plan ID', 'Week Start', 'Week End', 'Week Number', 'Week Type', 'Category',
+  'Mesocycle Theme', 'Microcycle Theme', 'Major Objective', 'Maintain Objective',
+  'Minor Objective', 'Created At', 'Updated At'
+];
+const PRACTICE_DAY_HEADERS = [
+  'Plan ID', 'Week Start', 'Date', 'Day Name', 'Theme', 'Demand Score', 'Equipment',
+  'Setup', 'Warmup', 'Main Work', 'Everyone', 'Short Sprints', 'Long Sprints',
+  'Sprint Hurdles', 'Long Hurdles / 300H', 'Long Jump / Triple Jump', 'High Jump',
+  'Relays', 'Custom Group', 'Jumps', 'Hurdles', 'Weights / Strength', 'Cooldown',
+  'Coach Notes', 'Athlete Notes', 'Competition Schedule'
+];
+
+
+const SEASON_TYPES = ['Indoor', 'Outdoor', 'Summer', 'Off-Season', 'Custom'];
+const TRAINING_GROUPS = [
+  'Combined Sprint / Jump Group', 'Short Sprints', 'Long Sprints', 'Sprint Hurdles',
+  'Long Hurdles', 'Long Jump / Triple Jump', 'High Jump', 'Custom Group'
+];
+const WORKLOADS = ['None', 'Rest', 'Recovery', 'Easy', 'Moderate', 'Hard', 'Very Hard', 'Training Camp', 'Competition'];
+const WEEK_TYPES = ['Normal Training Week', 'Routine Building Week', 'Recovery Week', 'Meet Week', 'Championship Week', 'Travel Week', 'Winter Break / Holiday Week', 'Testing Week', 'Custom'];
+const WEEK_CATEGORIES = ['General Preparation', 'Specific Preparation', 'Pre-Competition', 'Competition', 'Championship', 'Recovery', 'Custom'];
+const WEEK_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const EVENT_GROUPS = ['Everyone', 'Short Sprints', 'Long Sprints', 'Sprint Hurdles', 'Long Hurdles / 300H', 'Long Jump / Triple Jump', 'High Jump', 'Relays', 'Custom Group'];
+const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('Track & Field Training Design')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+
+function getHomeData() {
+  const spreadsheet = getStorageSpreadsheet_();
+  return {
+    appVersion: APP_VERSION,
+    storageUrl: spreadsheet.getUrl(),
+    storageName: spreadsheet.getName(),
+    plans: listPlans_(spreadsheet),
+    options: getAppOptions()
+  };
+}
+
+
+function getAppOptions() {
+  return {
+    seasonTypes: SEASON_TYPES,
+    trainingGroups: TRAINING_GROUPS,
+    workloads: WORKLOADS,
+    weekTypes: WEEK_TYPES,
+    weekCategories: WEEK_CATEGORIES,
+    routines: getRoutineLibrary_(),
+    builderOptions: getBuilderOptions_()
+  };
+}
+
+
+function getPlan(planId) {
+  const spreadsheet = getStorageSpreadsheet_();
+  const plan = readPlan_(spreadsheet, String(planId || ''));
+  if (!plan) throw new Error('That plan could not be found. It may have been deleted.');
+  return plan;
+}
+
+
+function savePlan(planInput) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getStorageSpreadsheet_();
+    const plan = normalizePlan_(planInput);
+    const existing = plan.id ? readPlan_(spreadsheet, plan.id) : null;
+    const now = new Date().toISOString();
+    if (!plan.id) plan.id = Utilities.getUuid();
+    plan.createdAt = existing ? existing.createdAt : now;
+    plan.updatedAt = now;
+    upsertPlan_(spreadsheet, plan);
+    replacePlanDays_(spreadsheet, plan);
+    SpreadsheetApp.flush();
+    return { success: true, plan: summarizePlan_(plan), message: 'Plan saved.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function duplicatePlan(planId) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getStorageSpreadsheet_();
+    const original = readPlan_(spreadsheet, String(planId || ''));
+    if (!original) throw new Error('That plan could not be found.');
+    const now = new Date().toISOString();
+    const copy = JSON.parse(JSON.stringify(original));
+    copy.id = Utilities.getUuid();
+    copy.planName = original.planName + ' (Copy)';
+    copy.createdAt = now;
+    copy.updatedAt = now;
+    upsertPlan_(spreadsheet, copy);
+    replacePlanDays_(spreadsheet, copy);
+    copyPlanWeeks_(spreadsheet, original.id, copy.id, now);
+    SpreadsheetApp.flush();
+    return { success: true, plan: summarizePlan_(copy), message: 'Plan duplicated.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function deletePlan(planId) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getStorageSpreadsheet_();
+    const id = String(planId || '');
+    if (!id) throw new Error('A plan ID is required.');
+    const plansSheet = spreadsheet.getSheetByName(PLANS_SHEET_NAME);
+    const planRows = getRowsBelowHeader_(plansSheet, PLAN_HEADERS.length);
+    const rowIndex = planRows.findIndex(row => String(row[0]) === id);
+    if (rowIndex === -1) throw new Error('That plan could not be found.');
+    plansSheet.deleteRow(rowIndex + 2);
+    removePlanDays_(spreadsheet, id);
+    removePlanWeeks_(spreadsheet, id);
+    removePracticeData_(spreadsheet, id);
+    SpreadsheetApp.flush();
+    return { success: true, message: 'Plan deleted.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function getPracticeWeek(planId, weekStart) {
+  const spreadsheet = getStorageSpreadsheet_();
+  const plan = readPlan_(spreadsheet, String(planId || ''));
+  if (!plan) throw new Error('That plan could not be found.');
+  const normalizedWeekStart = normalizeDate_(weekStart);
+  return readPracticeWeek_(spreadsheet, plan, normalizedWeekStart);
+}
+
+
+function savePracticeWeek(input) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getStorageSpreadsheet_();
+    const plan = readPlan_(spreadsheet, String(input && input.planId || ''));
+    if (!plan) throw new Error('That plan could not be found.');
+    const week = normalizePracticeWeek_(input, plan);
+    upsertPracticeWeek_(spreadsheet, week);
+    replacePracticeDays_(spreadsheet, week);
+    SpreadsheetApp.flush();
+    return { success: true, week: week, message: 'Practice week saved.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+
+
+function getWeekPlan(planId, weekStartInput) {
+  const spreadsheet = getStorageSpreadsheet_();
+  const id = String(planId || '');
+  const weekStart = normalizeDate_(weekStartInput);
+  const plan = readPlan_(spreadsheet, id);
+  if (!plan) throw new Error('The yearly plan for this microcycle could not be found.');
+  const weekEnd = addDays_(weekStart, 6);
+  if (!weekOverlapsPlan_(weekStart, weekEnd, plan)) throw new Error('That microcycle week is outside this yearly plan.');
+  const existing = readWeek_(spreadsheet, id, weekStart);
+  return { success: true, week: existing || defaultWeek_(id, weekStart, weekEnd, findMesocycleTheme_(plan, weekStart)) };
+}
+
+
+function saveWeekPlan(weekInput) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getStorageSpreadsheet_();
+    const week = normalizeWeek_(weekInput);
+    const plan = readPlan_(spreadsheet, week.planId);
+    if (!plan) throw new Error('The yearly plan for this microcycle could not be found.');
+    if (!weekOverlapsPlan_(week.weekStart, week.weekEnd, plan)) throw new Error('This microcycle week is outside the yearly plan date range.');
+    const existing = readWeek_(spreadsheet, week.planId, week.weekStart);
+    const now = new Date().toISOString();
+    week.createdAt = existing ? existing.createdAt : now;
+    week.updatedAt = now;
+    upsertWeek_(spreadsheet, week);
+    SpreadsheetApp.flush();
+    return { success: true, week: week, message: 'Microcycle saved.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function deleteWeekPlan(planId, weekStartInput) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getStorageSpreadsheet_();
+    deleteWeekRow_(spreadsheet, String(planId || ''), normalizeDate_(weekStartInput));
+    SpreadsheetApp.flush();
+    return { success: true, message: 'Microcycle cleared.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function getStorageSpreadsheet_() {
+  const properties = PropertiesService.getScriptProperties();
+  const storedId = properties.getProperty(STORAGE_PROPERTY);
+  if (storedId) {
+    try {
+      const spreadsheet = SpreadsheetApp.openById(storedId);
+      ensureSchema_(spreadsheet);
+      return spreadsheet;
+    } catch (error) {
+      properties.deleteProperty(STORAGE_PROPERTY);
+    }
+  }
+  const spreadsheet = SpreadsheetApp.create(STORAGE_FILE_NAME);
+  properties.setProperty(STORAGE_PROPERTY, spreadsheet.getId());
+  ensureSchema_(spreadsheet);
+  try {
+    DriveApp.getFileById(spreadsheet.getId()).setDescription('Automatically created storage for the Track & Field Training Design web app.');
+  } catch (error) {}
+  return spreadsheet;
+}
+
+
+function ensureSchema_(spreadsheet) {
+  ensureSheet_(spreadsheet, PLANS_SHEET_NAME, PLAN_HEADERS, false);
+  ensureSheet_(spreadsheet, DAYS_SHEET_NAME, DAY_HEADERS, true);
+  ensureSheet_(spreadsheet, WEEKS_SHEET_NAME, WEEK_HEADERS, true);
+  ensureSheet_(spreadsheet, PRACTICE_WEEKS_SHEET_NAME, PRACTICE_WEEK_HEADERS, true);
+  ensureSheet_(spreadsheet, PRACTICE_DAYS_SHEET_NAME, PRACTICE_DAY_HEADERS, true);
+}
+
+
+function ensureSheet_(spreadsheet, sheetName, headers, hidden) {
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    const sheets = spreadsheet.getSheets();
+    if (sheetName === PLANS_SHEET_NAME && sheets.length === 1 && sheets[0].getLastRow() === 0) {
+      sheet = sheets[0];
+      sheet.setName(sheetName);
+    } else {
+      sheet = spreadsheet.insertSheet(sheetName);
+    }
+  }
+  formatStorageSheet_(sheet, headers);
+  if (hidden && !sheet.isSheetHidden()) sheet.hideSheet();
+}
+
+
+function formatStorageSheet_(sheet, headers) {
+  const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  const needsHeaders = headers.some((header, index) => currentHeaders[index] !== header);
+  if (needsHeaders) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#0f172a').setFontColor('#ffffff');
+  sheet.autoResizeColumns(1, headers.length);
+}
+
+
+function listPlans_(spreadsheet) {
+  const planRows = getRowsBelowHeader_(spreadsheet.getSheetByName(PLANS_SHEET_NAME), PLAN_HEADERS.length);
+  const dayRows = getRowsBelowHeader_(spreadsheet.getSheetByName(DAYS_SHEET_NAME), DAY_HEADERS.length);
+  const statsByPlan = {};
+  dayRows.forEach(row => {
+    const planId = String(row[0] || '');
+    if (!statsByPlan[planId]) statsByPlan[planId] = { classifiedDays: 0, competitions: 0 };
+    if (String(row[2] || 'None') !== 'None') statsByPlan[planId].classifiedDays += 1;
+    if (toBoolean_(row[3])) statsByPlan[planId].competitions += 1;
+  });
+  return planRows.filter(row => row[0]).map(row => {
+    const plan = planFromRow_(row);
+    return Object.assign(summarizePlan_(plan), statsByPlan[plan.id] || { classifiedDays: 0, competitions: 0 });
+  }).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+}
+
+
+function readPlan_(spreadsheet, planId) {
+  if (!planId) return null;
+  const row = getRowsBelowHeader_(spreadsheet.getSheetByName(PLANS_SHEET_NAME), PLAN_HEADERS.length)
+    .find(item => String(item[0]) === String(planId));
+  if (!row) return null;
+  const plan = planFromRow_(row);
+  plan.days = {};
+  getRowsBelowHeader_(spreadsheet.getSheetByName(DAYS_SHEET_NAME), DAY_HEADERS.length).forEach(dayRow => {
+    if (String(dayRow[0]) !== String(planId)) return;
+    const date = String(dayRow[1] || '');
+    if (!date) return;
+    plan.days[date] = {
+      workload: WORKLOADS.includes(String(dayRow[2])) ? String(dayRow[2]) : 'None',
+      competition: toBoolean_(dayRow[3]),
+      competitionName: String(dayRow[4] || ''),
+      notes: String(dayRow[5] || '')
+    };
+  });
+  return plan;
+}
+
+
+function planFromRow_(row) {
+  let mesocycles = [];
+  try {
+    mesocycles = JSON.parse(String(row[8] || '[]'));
+    if (!Array.isArray(mesocycles)) mesocycles = [];
+  } catch (error) {
+    mesocycles = [];
+  }
+  return {
+    id: String(row[0] || ''), planName: String(row[1] || ''), seasonType: String(row[2] || ''),
+    customSeasonType: String(row[3] || ''), trainingGroup: String(row[4] || ''), customGroupName: String(row[5] || ''),
+    startDate: normalizeStoredDate_(row[6]), endDate: normalizeStoredDate_(row[7]), mesocycles: mesocycles,
+    createdAt: String(row[9] || ''), updatedAt: String(row[10] || ''), days: {}
+  };
+}
+
+
+function upsertPlan_(spreadsheet, plan) {
+  const sheet = spreadsheet.getSheetByName(PLANS_SHEET_NAME);
+  const rows = getRowsBelowHeader_(sheet, PLAN_HEADERS.length);
+  const rowIndex = rows.findIndex(row => String(row[0]) === String(plan.id));
+  const values = [[plan.id, plan.planName, plan.seasonType, plan.customSeasonType, plan.trainingGroup, plan.customGroupName, plan.startDate, plan.endDate, JSON.stringify(plan.mesocycles || []), plan.createdAt, plan.updatedAt]];
+  if (rowIndex === -1) sheet.getRange(sheet.getLastRow() + 1, 1, 1, PLAN_HEADERS.length).setValues(values);
+  else sheet.getRange(rowIndex + 2, 1, 1, PLAN_HEADERS.length).setValues(values);
+}
+
+
+function replacePlanDays_(spreadsheet, plan) {
+  const daysSheet = spreadsheet.getSheetByName(DAYS_SHEET_NAME);
+  const existingRows = getRowsBelowHeader_(daysSheet, DAY_HEADERS.length).filter(row => String(row[0]) !== String(plan.id));
+  const newRows = Object.keys(plan.days || {}).sort().map(date => {
+    const day = plan.days[date];
+    return [plan.id, date, day.workload, Boolean(day.competition), day.competitionName, day.notes];
+  }).filter(row => row[2] !== 'None' || row[3] || row[4] || row[5]);
+  rewriteRows_(daysSheet, DAY_HEADERS.length, existingRows.concat(newRows));
+}
+
+
+function removePlanDays_(spreadsheet, planId) {
+  const daysSheet = spreadsheet.getSheetByName(DAYS_SHEET_NAME);
+  rewriteRows_(daysSheet, DAY_HEADERS.length, getRowsBelowHeader_(daysSheet, DAY_HEADERS.length).filter(row => String(row[0]) !== String(planId)));
+}
+
+
+function removePracticeData_(spreadsheet, planId) {
+  const weekSheet = spreadsheet.getSheetByName(PRACTICE_WEEKS_SHEET_NAME);
+  const daySheet = spreadsheet.getSheetByName(PRACTICE_DAYS_SHEET_NAME);
+  rewriteRows_(weekSheet, PRACTICE_WEEK_HEADERS.length, getRowsBelowHeader_(weekSheet, PRACTICE_WEEK_HEADERS.length).filter(row => String(row[0]) !== String(planId)));
+  rewriteRows_(daySheet, PRACTICE_DAY_HEADERS.length, getRowsBelowHeader_(daySheet, PRACTICE_DAY_HEADERS.length).filter(row => String(row[0]) !== String(planId)));
+}
+
+
+function summarizePlan_(plan) {
+  return {
+    id: plan.id, planName: plan.planName, seasonType: plan.seasonType, customSeasonType: plan.customSeasonType,
+    trainingGroup: plan.trainingGroup, customGroupName: plan.customGroupName, startDate: plan.startDate,
+    endDate: plan.endDate, createdAt: plan.createdAt, updatedAt: plan.updatedAt
+  };
+}
+
+
+function normalizePlan_(input) {
+  const source = input || {};
+  const planName = cleanText_(source.planName, 120).trim();
+  const seasonType = cleanText_(source.seasonType, 50);
+  const customSeasonType = cleanText_(source.customSeasonType, 80);
+  const trainingGroup = cleanText_(source.trainingGroup, 100);
+  const customGroupName = cleanText_(source.customGroupName, 100);
+  const startDate = normalizeDate_(source.startDate);
+  const endDate = normalizeDate_(source.endDate);
+  if (!planName) throw new Error('Enter a plan name before saving.');
+  if (!SEASON_TYPES.includes(seasonType)) throw new Error('Select a valid season type.');
+  if (seasonType === 'Custom' && !customSeasonType.trim()) throw new Error('Enter a name for the custom season type.');
+  if (!TRAINING_GROUPS.includes(trainingGroup)) throw new Error('Select a valid training group.');
+  if (trainingGroup === 'Custom Group' && !customGroupName.trim()) throw new Error('Enter a name for the custom training group.');
+  if (dateDiffInDays_(startDate, endDate) < 0) throw new Error('The end date must be on or after the start date.');
+  if (dateDiffInDays_(startDate, endDate) > 550) throw new Error('Version 3 supports plans of up to 550 days.');
+
+
+  const mesocycles = Array.isArray(source.mesocycles) ? source.mesocycles.slice(0, 100).map((item, index) => {
+    const mesoStart = normalizeDate_(item.startDate || startDate);
+    const mesoEnd = normalizeDate_(item.endDate || endDate);
+    if (dateDiffInDays_(mesoStart, mesoEnd) < 0) throw new Error('Mesocycle ' + (index + 1) + ' has an end date before its start date.');
+    return { id: cleanText_(item.id || Utilities.getUuid(), 80), name: cleanText_(item.name || ('Mesocycle ' + (index + 1)), 80), startDate: mesoStart, endDate: mesoEnd };
+  }) : [];
+
+
+  const days = {};
+  const inputDays = source.days && typeof source.days === 'object' ? source.days : {};
+  Object.keys(inputDays).forEach(dateKey => {
+    let normalizedDate;
+    try { normalizedDate = normalizeDate_(dateKey); } catch (error) { return; }
+    if (!dateIsWithinRange_(normalizedDate, startDate, endDate)) return;
+    const day = inputDays[dateKey] || {};
+    const workload = WORKLOADS.includes(String(day.workload)) ? String(day.workload) : 'None';
+    const competition = Boolean(day.competition);
+    const competitionName = cleanText_(day.competitionName, 160);
+    const notes = cleanText_(day.notes, 5000);
+    if (workload !== 'None' || competition || competitionName || notes) days[normalizedDate] = { workload, competition, competitionName, notes };
+  });
+  return { id: cleanText_(source.id, 80), planName, seasonType, customSeasonType, trainingGroup, customGroupName, startDate, endDate, mesocycles, days, createdAt: cleanText_(source.createdAt, 40), updatedAt: cleanText_(source.updatedAt, 40) };
+}
+
+
+
+
+
+
+function removePlanWeeks_(spreadsheet, planId) {
+  const sheet = spreadsheet.getSheetByName(WEEKS_SHEET_NAME);
+  const remaining = getRowsBelowHeader_(sheet, WEEK_HEADERS.length).filter(row => String(row[0]) !== String(planId));
+  rewriteRows_(sheet, WEEK_HEADERS.length, remaining);
+}
+
+
+function copyPlanWeeks_(spreadsheet, originalPlanId, newPlanId, now) {
+  const sheet = spreadsheet.getSheetByName(WEEKS_SHEET_NAME);
+  const rows = getRowsBelowHeader_(sheet, WEEK_HEADERS.length);
+  const copied = rows.filter(row => String(row[0]) === String(originalPlanId)).map(row => {
+    const copy = row.slice(0, WEEK_HEADERS.length);
+    copy[0] = newPlanId;
+    copy[8] = now;
+    copy[9] = now;
+    return copy;
+  });
+  if (!copied.length) return;
+  const startRow = sheet.getLastRow() + 1;
+  sheet.getRange(startRow, 2, copied.length, 2).setNumberFormat('@');
+  sheet.getRange(startRow, 1, copied.length, WEEK_HEADERS.length).setValues(copied);
+}
+
+
+function readWeek_(spreadsheet, planId, weekStart) {
+  const sheet = spreadsheet.getSheetByName(WEEKS_SHEET_NAME);
+  const rows = getRowsBelowHeader_(sheet, WEEK_HEADERS.length);
+  const row = rows.find(item => String(item[0]) === String(planId) && normalizeStoredDate_(item[1]) === weekStart);
+  if (!row) return null;
+  return weekFromRow_(row);
+}
+
+
+function weekFromRow_(row) {
+  const weekStart = normalizeStoredDate_(row[1]);
+  return normalizeWeek_({
+    planId: String(row[0] || ''),
+    weekStart: weekStart,
+    weekEnd: normalizeStoredDate_(row[2]) || addDays_(weekStart, 6),
+    mesocycleTheme: String(row[3] || ''),
+    microcycleTheme: String(row[4] || ''),
+    demand: safeParseObject_(row[5], defaultDemand_()),
+    priorities: safeParseObject_(row[6], defaultPriorities_()),
+    dayPlans: safeParseObject_(row[7], defaultDayPlans_()),
+    createdAt: String(row[8] || ''),
+    updatedAt: String(row[9] || '')
+  });
+}
+
+
+function upsertWeek_(spreadsheet, week) {
+  const sheet = spreadsheet.getSheetByName(WEEKS_SHEET_NAME);
+  const rows = getRowsBelowHeader_(sheet, WEEK_HEADERS.length);
+  const rowIndex = rows.findIndex(row => String(row[0]) === String(week.planId) && normalizeStoredDate_(row[1]) === week.weekStart);
+  const values = [[week.planId, week.weekStart, week.weekEnd, week.mesocycleTheme, week.microcycleTheme, JSON.stringify(week.demand || defaultDemand_()), JSON.stringify(week.priorities || defaultPriorities_()), JSON.stringify(week.dayPlans || defaultDayPlans_()), week.createdAt, week.updatedAt]];
+  const targetRow = rowIndex === -1 ? sheet.getLastRow() + 1 : rowIndex + 2;
+  sheet.getRange(targetRow, 2, 1, 2).setNumberFormat('@');
+  sheet.getRange(targetRow, 1, 1, WEEK_HEADERS.length).setValues(values);
+}
+
+
+function deleteWeekRow_(spreadsheet, planId, weekStart) {
+  const sheet = spreadsheet.getSheetByName(WEEKS_SHEET_NAME);
+  const rows = getRowsBelowHeader_(sheet, WEEK_HEADERS.length);
+  const rowIndex = rows.findIndex(row => String(row[0]) === String(planId) && normalizeStoredDate_(row[1]) === weekStart);
+  if (rowIndex !== -1) sheet.deleteRow(rowIndex + 2);
+}
+
+
+function defaultWeek_(planId, weekStart, weekEnd, mesocycleTheme) {
+  return { planId, weekStart, weekEnd, mesocycleTheme: cleanText_(mesocycleTheme, 120), microcycleTheme: '', demand: defaultDemand_(), priorities: defaultPriorities_(), dayPlans: defaultDayPlans_(), createdAt: '', updatedAt: '' };
+}
+
+
+function normalizeWeek_(input) {
+  const source = input || {};
+  const planId = cleanText_(source.planId, 80);
+  const weekStart = normalizeDate_(source.weekStart);
+  const weekEnd = source.weekEnd ? normalizeDate_(source.weekEnd) : addDays_(weekStart, 6);
+  if (!planId) throw new Error('A plan ID is required for the microcycle.');
+  if (dateDiffInDays_(weekStart, weekEnd) < 0 || dateDiffInDays_(weekStart, weekEnd) > 6) throw new Error('A microcycle week can only cover Monday through Sunday.');
+  const demand = defaultDemand_();
+  const sourceDemand = source.demand && typeof source.demand === 'object' ? source.demand : {};
+  WEEK_DAYS.forEach(day => demand[day] = clampDemand_(sourceDemand[day]));
+  const priorities = defaultPriorities_();
+  const sourcePriorities = source.priorities && typeof source.priorities === 'object' ? source.priorities : {};
+  ['major', 'maintain', 'minor'].forEach(key => priorities[key] = uniqueCleanList_(Array.isArray(sourcePriorities[key]) ? sourcePriorities[key] : [], 80, 100));
+  const dayPlans = defaultDayPlans_();
+  const sourceDayPlans = source.dayPlans && typeof source.dayPlans === 'object' ? source.dayPlans : {};
+  WEEK_DAYS.forEach(day => {
+    const dp = sourceDayPlans[day] && typeof sourceDayPlans[day] === 'object' ? sourceDayPlans[day] : {};
+    dayPlans[day] = { means: uniqueCleanList_(Array.isArray(dp.means) ? dp.means : [], 80, 100), notes: cleanText_(dp.notes, 7000) };
+  });
+  return { planId, weekStart, weekEnd, mesocycleTheme: cleanText_(source.mesocycleTheme, 120), microcycleTheme: cleanText_(source.microcycleTheme, 120), demand, priorities, dayPlans, createdAt: cleanText_(source.createdAt, 40), updatedAt: cleanText_(source.updatedAt, 40) };
+}
+
+
+function defaultDemand_() { return { Mon: 0, Tue: 0, Wed: 0, Thu: 0, Fri: 0, Sat: 0, Sun: 0 }; }
+function defaultPriorities_() { return { major: [], maintain: [], minor: [] }; }
+function defaultDayPlans_() { return { Mon: { means: [], notes: '' }, Tue: { means: [], notes: '' }, Wed: { means: [], notes: '' }, Thu: { means: [], notes: '' }, Fri: { means: [], notes: '' }, Sat: { means: [], notes: '' }, Sun: { means: [], notes: '' } }; }
+function safeParseObject_(value, fallback) { try { const parsed = JSON.parse(String(value || '')); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed; } catch (error) {} return JSON.parse(JSON.stringify(fallback)); }
+function clampDemand_(value) { return Math.max(0, Math.min(10, Math.round(Number(value || 0)))); }
+function uniqueCleanList_(list, itemLength, maxItems) { const seen = {}; const output = []; list.forEach(item => { const text = cleanText_(item, itemLength).trim(); if (!text || seen[text]) return; seen[text] = true; output.push(text); }); return output.slice(0, maxItems); }
+function weekOverlapsPlan_(weekStart, weekEnd, plan) { return weekStart <= plan.endDate && weekEnd >= plan.startDate; }
+
+
+function readPracticeWeek_(spreadsheet, plan, weekStart) {
+  const weekEnd = addDays_(weekStart, 6);
+  const weekRows = getRowsBelowHeader_(spreadsheet.getSheetByName(PRACTICE_WEEKS_SHEET_NAME), PRACTICE_WEEK_HEADERS.length);
+  const existing = weekRows.find(row => String(row[0]) === plan.id && normalizeStoredDate_(row[1]) === weekStart);
+  const microcycle = existing ? null : readWeek_(spreadsheet, plan.id, weekStart);
+  const week = existing ? practiceWeekFromRow_(existing) : createDefaultPracticeWeek_(plan, weekStart, weekEnd, microcycle);
+  if (existing) week.days = createDefaultPracticeDays_(plan, weekStart);
+  const dayRows = getRowsBelowHeader_(spreadsheet.getSheetByName(PRACTICE_DAYS_SHEET_NAME), PRACTICE_DAY_HEADERS.length);
+  dayRows.forEach(row => {
+    if (String(row[0]) !== plan.id || normalizeStoredDate_(row[1]) !== weekStart) return;
+    const day = practiceDayFromRow_(row);
+    week.days[day.date] = day;
+  });
+  return week;
+}
+
+
+function createDefaultPracticeWeek_(plan, weekStart, weekEnd, microcycle) {
+  const week = {
+    planId: plan.id, weekStart, weekEnd, weekNumber: Math.floor(dateDiffInDays_(plan.startDate, weekStart) / 7) + 1,
+    weekType: 'Normal Training Week', category: 'General Preparation', mesocycleTheme: microcycle ? microcycle.mesocycleTheme : findMesocycleTheme_(plan, weekStart),
+    microcycleTheme: microcycle ? microcycle.microcycleTheme : '',
+    majorObjective: microcycle && microcycle.priorities ? (microcycle.priorities.major || []).join('; ') : '',
+    maintainObjective: microcycle && microcycle.priorities ? (microcycle.priorities.maintain || []).join('; ') : '',
+    minorObjective: microcycle && microcycle.priorities ? (microcycle.priorities.minor || []).join('; ') : '',
+    updatedAt: '', days: {}
+  };
+  week.days = createDefaultPracticeDays_(plan, weekStart);
+  if (microcycle && microcycle.demand) {
+    WEEK_DAYS.forEach((dayKey, index) => {
+      const date = addDays_(weekStart, index);
+      if (!week.days[date]) return;
+      week.days[date].demandScore = clampDemand_(microcycle.demand[dayKey]);
+      const dayPlan = microcycle.dayPlans && microcycle.dayPlans[dayKey] ? microcycle.dayPlans[dayKey] : null;
+      if (dayPlan) {
+        week.days[date].mainWork = Array.isArray(dayPlan.means) ? dayPlan.means.join('\n') : '';
+        week.days[date].coachNotes = dayPlan.notes || '';
+      }
+    });
+  }
+  return week;
+}
+
+
+function createDefaultPracticeDays_(plan, weekStart) {
+  const days = {};
+  for (let index = 0; index < 7; index += 1) {
+    const date = addDays_(weekStart, index);
+    const calendarDay = (plan.days || {})[date] || {};
+    days[date] = {
+      date, dayName: DAY_NAMES[index], theme: '', demandScore: defaultDemandFromWorkload_(calendarDay.workload),
+      equipment: '', setup: '', warmup: '', mainWork: '', everyone: '', shortSprints: '', longSprints: '', sprintHurdles: '',
+      longHurdles: '', longJumpTripleJump: '', highJump: '', relays: '', customGroup: '', jumps: '', hurdles: '', weightsStrength: '',
+      cooldown: '', coachNotes: '', athleteNotes: '', competitionSchedule: calendarDay.competition ? (calendarDay.competitionName || 'Competition') : ''
+    };
+  }
+  return days;
+}
+
+
+function normalizePracticeWeek_(input, plan) {
+  const weekStart = normalizeDate_(input.weekStart);
+  const weekEnd = addDays_(weekStart, 6);
+  if (!dateIsWithinRange_(weekStart, plan.startDate, plan.endDate)) throw new Error('Choose a week that starts inside the season date range.');
+  const week = {
+    planId: plan.id,
+    weekStart,
+    weekEnd,
+    weekNumber: Number(input.weekNumber || Math.floor(dateDiffInDays_(plan.startDate, weekStart) / 7) + 1),
+    weekType: WEEK_TYPES.includes(String(input.weekType)) ? String(input.weekType) : 'Normal Training Week',
+    category: WEEK_CATEGORIES.includes(String(input.category)) ? String(input.category) : 'General Preparation',
+    mesocycleTheme: cleanText_(input.mesocycleTheme, 160),
+    microcycleTheme: cleanText_(input.microcycleTheme, 160),
+    majorObjective: cleanText_(input.majorObjective, 1000),
+    maintainObjective: cleanText_(input.maintainObjective, 1000),
+    minorObjective: cleanText_(input.minorObjective, 1000),
+    updatedAt: new Date().toISOString(),
+    days: {}
+  };
+  const inputDays = input.days && typeof input.days === 'object' ? input.days : {};
+  const defaults = createDefaultPracticeDays_(plan, weekStart);
+  Object.keys(defaults).forEach(date => {
+    const source = inputDays[date] || defaults[date];
+    week.days[date] = normalizePracticeDay_(source, date, defaults[date].dayName);
+  });
+  return week;
+}
+
+
+function normalizePracticeDay_(source, date, dayName) {
+  const demand = Math.max(0, Math.min(10, Number(source.demandScore || 0)));
+  return {
+    date, dayName,
+    theme: cleanText_(source.theme, 160), demandScore: demand,
+    equipment: cleanText_(source.equipment, 2000), setup: cleanText_(source.setup, 3000), warmup: cleanText_(source.warmup, 5000),
+    mainWork: cleanText_(source.mainWork, 8000), everyone: cleanText_(source.everyone, 6000), shortSprints: cleanText_(source.shortSprints, 6000),
+    longSprints: cleanText_(source.longSprints, 6000), sprintHurdles: cleanText_(source.sprintHurdles, 6000), longHurdles: cleanText_(source.longHurdles, 6000),
+    longJumpTripleJump: cleanText_(source.longJumpTripleJump, 6000), highJump: cleanText_(source.highJump, 6000), relays: cleanText_(source.relays, 6000),
+    customGroup: cleanText_(source.customGroup, 6000), jumps: cleanText_(source.jumps, 6000), hurdles: cleanText_(source.hurdles, 6000),
+    weightsStrength: cleanText_(source.weightsStrength, 6000), cooldown: cleanText_(source.cooldown, 5000),
+    coachNotes: cleanText_(source.coachNotes, 5000), athleteNotes: cleanText_(source.athleteNotes, 5000), competitionSchedule: cleanText_(source.competitionSchedule, 5000)
+  };
+}
+
+
+function upsertPracticeWeek_(spreadsheet, week) {
+  const sheet = spreadsheet.getSheetByName(PRACTICE_WEEKS_SHEET_NAME);
+  const rows = getRowsBelowHeader_(sheet, PRACTICE_WEEK_HEADERS.length);
+  const rowIndex = rows.findIndex(row => String(row[0]) === week.planId && normalizeStoredDate_(row[1]) === week.weekStart);
+  const values = [[week.planId, week.weekStart, week.weekEnd, week.weekNumber, week.weekType, week.category, week.mesocycleTheme, week.microcycleTheme, week.majorObjective, week.maintainObjective, week.minorObjective, week.createdAt || '', week.updatedAt]];
+  if (rowIndex === -1) sheet.getRange(sheet.getLastRow() + 1, 1, 1, PRACTICE_WEEK_HEADERS.length).setValues(values);
+  else sheet.getRange(rowIndex + 2, 1, 1, PRACTICE_WEEK_HEADERS.length).setValues(values);
+}
+
+
+function replacePracticeDays_(spreadsheet, week) {
+  const sheet = spreadsheet.getSheetByName(PRACTICE_DAYS_SHEET_NAME);
+  const existingRows = getRowsBelowHeader_(sheet, PRACTICE_DAY_HEADERS.length).filter(row => !(String(row[0]) === week.planId && normalizeStoredDate_(row[1]) === week.weekStart));
+  const newRows = Object.keys(week.days).sort().map(date => practiceDayToRow_(week, week.days[date]));
+  rewriteRows_(sheet, PRACTICE_DAY_HEADERS.length, existingRows.concat(newRows));
+}
+
+
+function practiceWeekFromRow_(row) {
+  return {
+    planId: String(row[0] || ''), weekStart: normalizeStoredDate_(row[1]), weekEnd: normalizeStoredDate_(row[2]),
+    weekNumber: Number(row[3] || 1), weekType: String(row[4] || 'Normal Training Week'), category: String(row[5] || 'General Preparation'),
+    mesocycleTheme: String(row[6] || ''), microcycleTheme: String(row[7] || ''), majorObjective: String(row[8] || ''),
+    maintainObjective: String(row[9] || ''), minorObjective: String(row[10] || ''), createdAt: String(row[11] || ''), updatedAt: String(row[12] || ''), days: {}
+  };
+}
+
+
+function practiceDayFromRow_(row) {
+  return {
+    date: normalizeStoredDate_(row[2]), dayName: String(row[3] || ''), theme: String(row[4] || ''), demandScore: Number(row[5] || 0),
+    equipment: String(row[6] || ''), setup: String(row[7] || ''), warmup: String(row[8] || ''), mainWork: String(row[9] || ''),
+    everyone: String(row[10] || ''), shortSprints: String(row[11] || ''), longSprints: String(row[12] || ''), sprintHurdles: String(row[13] || ''),
+    longHurdles: String(row[14] || ''), longJumpTripleJump: String(row[15] || ''), highJump: String(row[16] || ''), relays: String(row[17] || ''),
+    customGroup: String(row[18] || ''), jumps: String(row[19] || ''), hurdles: String(row[20] || ''), weightsStrength: String(row[21] || ''),
+    cooldown: String(row[22] || ''), coachNotes: String(row[23] || ''), athleteNotes: String(row[24] || ''), competitionSchedule: String(row[25] || '')
+  };
+}
+
+
+function practiceDayToRow_(week, day) {
+  return [week.planId, week.weekStart, day.date, day.dayName, day.theme, day.demandScore, day.equipment, day.setup, day.warmup, day.mainWork, day.everyone, day.shortSprints, day.longSprints, day.sprintHurdles, day.longHurdles, day.longJumpTripleJump, day.highJump, day.relays, day.customGroup, day.jumps, day.hurdles, day.weightsStrength, day.cooldown, day.coachNotes, day.athleteNotes, day.competitionSchedule];
+}
+
+
+function rewriteRows_(sheet, columnCount, rows) {
+  const existingRowCount = Math.max(sheet.getLastRow() - 1, 0);
+  if (existingRowCount > 0) sheet.getRange(2, 1, existingRowCount, columnCount).clearContent();
+  if (rows.length > 0) sheet.getRange(2, 1, rows.length, columnCount).setValues(rows);
+}
+
+
+function getRowsBelowHeader_(sheet, columnCount) {
+  const rowCount = Math.max(sheet.getLastRow() - 1, 0);
+  if (rowCount === 0) return [];
+  return sheet.getRange(2, 1, rowCount, columnCount).getValues();
+}
+
+
+function normalizeDate_(value) {
+  const text = String(value || '');
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (!match) throw new Error('Use valid dates in yyyy-mm-dd format.');
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) throw new Error('Use valid dates in yyyy-mm-dd format.');
+  return text;
+}
+
+
+function normalizeStoredDate_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, 'UTC', 'yyyy-MM-dd');
+  }
+  return String(value || '');
+}
+
+
+function dateDiffInDays_(startDate, endDate) {
+  const start = new Date(startDate + 'T00:00:00Z');
+  const end = new Date(endDate + 'T00:00:00Z');
+  return Math.round((end.getTime() - start.getTime()) / 86400000);
+}
+
+
+function dateIsWithinRange_(date, startDate, endDate) {
+  return date >= startDate && date <= endDate;
+}
+
+
+function addDays_(dateText, amount) {
+  const date = new Date(dateText + 'T00:00:00Z');
+  date.setUTCDate(date.getUTCDate() + amount);
+  return Utilities.formatDate(date, 'UTC', 'yyyy-MM-dd');
+}
+
+
+function cleanText_(value, maximumLength) {
+  return String(value == null ? '' : value).slice(0, maximumLength);
+}
+
+
+function toBoolean_(value) {
+  return value === true || String(value).toLowerCase() === 'true';
+}
+
+
+function defaultDemandFromWorkload_(workload) {
+  const scores = { Rest: 0, Recovery: 2, Easy: 3, Moderate: 5, Hard: 7, 'Very Hard': 9, 'Training Camp': 8, Competition: 9 };
+  return scores[String(workload || '')] || 0;
+}
+
+
+function findMesocycleTheme_(plan, date) {
+  const meso = (plan.mesocycles || []).find(item => dateIsWithinRange_(date, item.startDate, item.endDate));
+  return meso ? meso.name : '';
+}
+
+
+function getRoutineLibrary_() {
+  return [
+    routine_('30m Warm Up', 'Warmups', 'warmup', '2 lap jog\nDynamic mobility\nA-skip / B-skip\nDribbles 10m / 20m / 30m\nBuildups 3 x 30m'),
+    routine_('Acceleration Warm Up', 'Acceleration Warmups', 'warmup', 'Jog + mobility\nWall switches 2 x 10 each\nFalling starts 3 x 10m\nPush-up starts 3 x 10m\nBuildups 3 x 30m'),
+    routine_('Max V Warm Up', 'Max V Warmups', 'warmup', 'Mobility series\nWickets rhythm walk-through\nDribbles\nFly-in buildups 3 x 30m\nFast relaxed strides 2 x 40m'),
+    routine_('Sallies Warm Up', 'Warmups', 'warmup', 'Sallies mobility series\nLeg swings\nLunge matrix\nSprint drills\nProgressive accelerations'),
+    routine_('Competition Warm Up', 'Competition Warmups', 'warmup', 'General warmup\nEvent-specific drills\nBlock starts or approach checkmarks\n2-3 race rhythm efforts\nFinal cue review'),
+    routine_('Tempo Warm Up', 'Tempo Warmups', 'warmup', 'Easy jog\nMobility\nSprint drill circuit\n4 x 60m progressive strides'),
+    routine_('Hurdle Mobility Cool Down', 'Cooldowns', 'cooldown', 'Walk back recovery\nHurdle walkovers forward / lateral\nTrail-leg mobility\nHip flexor stretch\nBreathing reset'),
+    routine_('Hamstring Cool Down', 'Cooldowns', 'cooldown', 'Light jog\nHamstring floss\nGlute bridge iso holds\nCalf stretch\nLow-intensity mobility'),
+    routine_('PVC Cool Down', 'Cooldowns', 'cooldown', 'PVC pass-throughs\nOverhead squat hold\nT-spine rotations\nHip mobility\nBreathing reset'),
+    routine_('Cancer Core', 'Core', 'weightsStrength', 'Front plank\nSide plank each side\nDead bug\nHollow hold\nBird dog'),
+    routine_('Core X', 'Core', 'weightsStrength', 'X-plank\nV-ups\nRussian twists\nLeg lowers\nBack extensions'),
+    routine_('Monster', 'General Strength', 'weightsStrength', 'Pushups\nSquats\nLunges\nBurpees\nMountain climbers\nRest and repeat'),
+    routine_('General Strength Circuit 1', 'General Strength', 'weightsStrength', 'Bodyweight squats\nPushups\nReverse lunges\nPlank\nCalf raises'),
+    routine_('General Strength Circuit 2', 'General Strength', 'weightsStrength', 'Step-ups\nInverted rows\nSingle-leg RDL\nSide plank\nPogos'),
+    routine_('Killer Pillar', 'Core', 'weightsStrength', 'Pillar march\nPillar reach\nSide pillar\nGlute bridge march\nCrawl variations'),
+    routine_('Med Ball Throws Basic', 'Med Ball', 'mainWork', 'SLJ 3 x 3\nOHB 5 x 2\nBetween-leg forward throw 5 x 2\nRotational throw 3 x 2 each'),
+    routine_('Basic Jump Power Menu', 'Multi-Jumps', 'jumps', 'Pogos 2 x 20\nStanding long jump 4 x 2\nBounds 3 x 20m\nBox takeoff popups 3 x 3'),
+    routine_('Jumpers Approach Work', 'Multi-Jumps', 'jumps', 'Checkmark review\nRunway rhythm buildups\nShort approach takeoffs\nFull approach rehearsal'),
+    routine_('Hurdle Technical Block', 'Hurdle Mobility', 'hurdles', 'Lead-leg wall drill\nTrail-leg wall drill\n3 x H1\n3 x H1-H2\n2 x H1-H3 rhythm'),
+    routine_('Relay Handoff Block', 'Relays', 'relays', 'Exchange zone review\nStanding handoffs\nJog-in handoffs\n4 x timed zone exchanges'),
+    routine_('Tempo Options', 'Main Work', 'mainWork', '8 x 100m tempo\nor 6 x 150m tempo\nor grass diagonals 12 minutes'),
+    routine_('Acceleration Options', 'Main Work', 'mainWork', '3 x 10m\n3 x 20m\n3 x 30m\nFull recovery, high intent'),
+    routine_('Max Velocity Options', 'Main Work', 'mainWork', 'Wickets 4 reps\nFly 10s x 4\nFly 20s x 3\nFull recovery')
+  ];
+}
+
+
+function routine_(name, category, target, text) {
+  return { name: name, category: category, defaultTarget: target, text: text };
+}
+
+
+function getBuilderOptions_() {
+  return {
+    themes: ['Acceleration', 'Max Velocity', 'Speed Endurance', 'Tempo / Extensive Tempo', 'Hurdle Rhythm', 'Jumps Approach', 'Jumps Power', 'Relay Exchanges', 'Weights / Strength', 'Recovery', 'Meet Prep', 'Competition', 'Testing', 'Custom'],
+    equipment: ['Blocks', 'Mini hurdles / wickets', 'Hurdles', 'Cones', 'Med balls', 'PVC pipes', 'Jump runway', 'High jump mats', 'Relay batons', 'Timing gates', 'Weight room', 'None'],
+    setup: ['Direction of intention / agenda / bathroom / two-lap jog / stretch', 'Blocks set at start line', 'Wickets spaced and marked', 'Hurdle lanes set', 'Jump runway checkmarks set', 'Relay zones marked', 'Weight room stations ready'],
+    warmup: ['30m Warm Up', 'Acceleration Warm Up', 'Max V Warm Up', 'Sallies Warm Up', 'Competition Warm Up', 'Tempo Warm Up'],
+    mainWork: ['Acceleration Options', 'Max Velocity Options', 'Tempo Options', 'Med Ball Throws Basic'],
+    cooldown: ['Hurdle Mobility Cool Down', 'Hamstring Cool Down', 'PVC Cool Down'],
+    relays: ['Relay Handoff Block'],
+    jumps: ['Basic Jump Power Menu', 'Jumpers Approach Work'],
+    hurdles: ['Hurdle Technical Block'],
+    weightsStrength: ['Cancer Core', 'Core X', 'Monster', 'General Strength Circuit 1', 'General Strength Circuit 2', 'Killer Pillar']
+  };
+}
